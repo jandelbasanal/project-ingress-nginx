@@ -1,0 +1,81 @@
+name: Destroy EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type 'destroy' to confirm teardown (this deletes the EKS cluster)
+        required: true
+        default: 'destroy'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  EKS_CLUSTER_NAME: demo-cluster
+
+jobs:
+  destroy:
+    if: ${{ github.event.inputs.confirm == 'destroy' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          curl -sLo /tmp/eksctl.tar.gz https://github.com/weaveworks/eksctl/releases/download/v0.183.0/eksctl_Linux_amd64.tar.gz
+          tar -C /tmp -xzf /tmp/eksctl.tar.gz
+          sudo mv /tmp/eksctl /usr/local/bin/eksctl
+
+      - name: Delete EKS cluster (may take 10-20 minutes)
+        run: |
+          set -euo pipefail
+          echo "Deleting cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Cleanup IAM policy/role for AWS Load Balancer Controller (best-effort)
+        run: |
+          set -euo pipefail
+          ROLE_NAME="AmazonEKSLoadBalancerControllerRole"
+          POLICY_NAME="AWSLoadBalancerControllerIAMPolicy"
+          # Get role if exists
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Role $ROLE_NAME exists; attempting to detach inline and managed policies and delete it"
+            # Try to detach the managed policy if attached
+            POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName==\`$POLICY_NAME\`].Arn" --output text || true)
+            if [ -n "${POLICY_ARN:-}" ]; then
+              aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || true
+            fi
+            # Delete any inline policies
+            for p in $(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames[]' --output text || true); do
+              aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$p" || true
+            done
+            # Delete the role
+            aws iam delete-role --role-name "$ROLE_NAME" || true
+          else
+            echo "Role $ROLE_NAME not found; skipping"
+          fi
+
+          # Delete the customer-managed policy if it exists and is not attached
+          POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName==\`$POLICY_NAME\`].Arn" --output text || true)
+          if [ -n "${POLICY_ARN:-}" ]; then
+            ATTACHMENTS=$(aws iam list-entities-for-policy --policy-arn "$POLICY_ARN" --query 'PolicyRoles|length(@)' --output text || echo 0)
+            if [ "${ATTACHMENTS}" = "0" ]; then
+              echo "Deleting policy $POLICY_NAME"
+              aws iam delete-policy --policy-arn "$POLICY_ARN" || true
+            else
+              echo "Policy $POLICY_NAME still attached to entities; not deleting"
+            fi
+          else
+            echo "Policy $POLICY_NAME not found; skipping"
+          fi
