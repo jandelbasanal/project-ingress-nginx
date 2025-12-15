@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-world
+  namespace: demo
+  labels:
+    app: hello-world
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello-world
+  template:
+    metadata:
+      labels:
+        app: hello-world
+    spec:
+      containers:
+        - name: app
+          image: public.ecr.aws/docker/library/nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: html
+          configMap:
+            name: hello-world-html
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-world-html
+  namespace: demo
+  labels:
+    app: hello-world
+data:
+  index.html: |
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Hello from Kubernetes</title>
+      </head>
+      <body>
+        <h1>Hello World</h1>
+        <p>Served by NGINX pod behind AWS ALB via Ingress.</p>
+      </body>
+    </html>

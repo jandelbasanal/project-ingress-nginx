@@ -1,0 +1,32 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: demo-cluster
+  region: us-east-1
+  version: "1.30"
+
+availabilityZones: [us-east-1a, us-east-1b, us-east-1c]
+
+vpc:
+  # Set to true if you want a private cluster; for test we use public+private subnets managed by eksctl
+  nat: HighlyAvailable
+
+managedNodeGroups:
+  - name: ng-app
+    instanceType: t3.medium
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 6
+    volumeSize: 20
+    labels: { role: app }
+    ssh:
+      allow: false
+    iam:
+      withAddonPolicies:
+        externalDNS: true
+        certManager: true
+        albIngress: true
+
+iam:
+  withOIDC: true
