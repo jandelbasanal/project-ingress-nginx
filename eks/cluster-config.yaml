@@ -3,14 +3,15 @@ kind: ClusterConfig
 
 metadata:
   name: demo-cluster
-  region: us-east-1
+  region: ap-northeast-1
   version: "1.30"
 
-availabilityZones: [us-east-1a, us-east-1b, us-east-1c]
+availabilityZones: [ap-northeast-1a, ap-northeast-1c, ap-northeast-1d]
 
 vpc:
   # Set to true if you want a private cluster; for test we use public+private subnets managed by eksctl
-  nat: HighlyAvailable
+  nat:
+    gateway: HighlyAvailable
 
 managedNodeGroups:
   - name: ng-app

@@ -10,7 +10,7 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  EKS_CLUSTER_NAME: demo-cluster
 
 jobs:
   deploy:
