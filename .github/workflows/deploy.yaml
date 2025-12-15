@@ -37,6 +37,15 @@ jobs:
           tar -C /tmp -xzf /tmp/eksctl.tar.gz
           sudo mv /tmp/eksctl /usr/local/bin/eksctl
 
+      - name: Ensure EKS cluster exists (create if missing)
+        run: |
+          if ! aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Cluster $EKS_CLUSTER_NAME not found in $AWS_REGION. Creating via eksctl..."
+            eksctl create cluster -f eks/cluster-config.yaml
+          else
+            echo "Cluster $EKS_CLUSTER_NAME exists."
+          fi
+
       - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
