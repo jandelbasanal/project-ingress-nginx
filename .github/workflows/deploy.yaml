@@ -151,14 +151,42 @@ jobs:
             fi
           done
 
+      - name: Verify Ingress and ALB Controller status
+        run: |
+          echo "=== Checking Ingress status ==="
+          kubectl -n demo describe ingress hello-world || true
+          echo ""
+          echo "=== Checking ALB Controller logs ==="
+          kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=30 || true
+          echo ""
+          echo "=== Checking for ALB events ==="
+          kubectl -n demo get events --sort-by='.lastTimestamp' || true
+
       - name: Wait for Ingress address
         run: |
-          for i in {1..60}; do
-            echo "Attempt $i: waiting for Ingress hostname..."
+          for i in {1..120}; do
+            echo "Attempt $i: waiting for Ingress hostname (timeout: 20 minutes)..."
             host=$(kubectl -n demo get ingress hello-world -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true)
-            if [ -n "$host" ]; then echo "ALB Hostname: $host"; echo "$host" > alb_hostname.txt; break; fi
+            if [ -n "$host" ]; then
+              echo "ALB Hostname: $host"
+              echo "$host" > alb_hostname.txt
+              break
+            fi
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "Still waiting... Checking Ingress status:"
+              kubectl -n demo get ingress hello-world -o wide || true
+            fi
             sleep 10
           done
+          if [ ! -s alb_hostname.txt ]; then
+            echo "ERROR: Ingress address never became available"
+            echo "=== Final Ingress status ==="
+            kubectl -n demo describe ingress hello-world || true
+            echo ""
+            echo "=== Recent ALB Controller logs ==="
+            kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50 || true
+            exit 1
+          fi
           test -s alb_hostname.txt
 
       - name: Upload ALB hostname artifact
