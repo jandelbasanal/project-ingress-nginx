@@ -80,4 +80,5 @@ Workflow file: `.github/workflows/deploy.yaml`
 - For cost control, delete the cluster when done:
 ```bash
 eksctl delete cluster --name demo-cluster --region us-east-1
+
 ```
