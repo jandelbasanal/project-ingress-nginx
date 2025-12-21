@@ -137,9 +137,13 @@ jobs:
 
       - name: Delete EKS cluster (may take 10-20 minutes)
         run: |
-          set -euo pipefail
-          echo "Deleting cluster $EKS_CLUSTER_NAME in $AWS_REGION"
-          eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          set +e
+          if aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Cluster $EKS_CLUSTER_NAME exists; deleting via eksctl..."
+            eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          else
+            echo "Cluster $EKS_CLUSTER_NAME not found in $AWS_REGION; skipping eksctl delete"
+          fi
 
       - name: Cleanup orphaned AWS Load Balancers and Target Groups by tag (post-delete, best-effort)
         run: |
