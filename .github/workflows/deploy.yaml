@@ -37,13 +37,32 @@ jobs:
           tar -C /tmp -xzf /tmp/eksctl.tar.gz
           sudo mv /tmp/eksctl /usr/local/bin/eksctl
 
+      - name: Cleanup stale CloudFormation stacks (if any)
+        run: |
+          set +e
+          STACK_NAME="eksctl-${EKS_CLUSTER_NAME}-cluster"
+          if aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            echo "Found CloudFormation stack: $STACK_NAME"
+            STACK_STATUS=$(aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text)
+            echo "Stack status: $STACK_STATUS"
+            if [[ "$STACK_STATUS" == *"FAILED"* ]] || [[ "$STACK_STATUS" == "ROLLBACK_COMPLETE" ]]; then
+              echo "Deleting failed/rollback stack: $STACK_NAME"
+              aws cloudformation delete-stack --region "$AWS_REGION" --stack-name "$STACK_NAME"
+              echo "Waiting for stack deletion (up to 10 minutes)..."
+              aws cloudformation wait stack-delete-complete --region "$AWS_REGION" --stack-name "$STACK_NAME" || true
+              echo "Stack deletion completed or timed out"
+            else
+              echo "Stack status is $STACK_STATUS; not deleting"
+            fi
+          else
+            echo "No stale CloudFormation stack found"
+          fi
+          set -e
+
       - name: Ensure EKS cluster exists (create if missing)
         run: |
           if ! aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
-            echo "Cluster $EKS_CLUSTER_NAME not found in $AWS_REGION."
-            echo "Attempting to clean up any leftover eksctl CloudFormation stacks..."
-            eksctl delete cluster --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME" || true
-            echo "Creating cluster via eksctl..."
+            echo "Cluster $EKS_CLUSTER_NAME not found in $AWS_REGION. Creating via eksctl..."
             eksctl create cluster -f eks/cluster-config.yaml
           else
             echo "Cluster $EKS_CLUSTER_NAME exists."
