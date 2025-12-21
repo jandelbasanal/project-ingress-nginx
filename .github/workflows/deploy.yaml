@@ -121,11 +121,35 @@ jobs:
             --set serviceAccount.create=false \
             --set serviceAccount.name=aws-load-balancer-controller
 
+      - name: Wait for AWS Load Balancer Controller to be ready
+        run: |
+          echo "Waiting for AWS Load Balancer Controller webhook to be ready..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=aws-load-balancer-controller -n kube-system --timeout=300s || true
+          echo "Waiting for webhook service endpoints..."
+          for i in {1..60}; do
+            ENDPOINTS=$(kubectl get endpoints aws-load-balancer-webhook-service -n kube-system -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+            if [ -n "$ENDPOINTS" ]; then
+              echo "Webhook endpoints are available: $ENDPOINTS"
+              break
+            fi
+            echo "Attempt $i: Webhook endpoints not yet available, waiting..."
+            sleep 5
+          done
+          sleep 5
+
       - name: Deploy app manifests
         run: |
-          kubectl apply -f k8s/app/deployment.yaml
-          kubectl apply -f k8s/app/service.yaml
-          kubectl apply -f k8s/app/ingress.yaml
+          for i in {1..5}; do
+            echo "Attempt $i: Deploying app manifests..."
+            kubectl apply -f k8s/app/deployment.yaml && \
+            kubectl apply -f k8s/app/service.yaml && \
+            kubectl apply -f k8s/app/ingress.yaml && \
+            break
+            if [ $i -lt 5 ]; then
+              echo "Failed to deploy, retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
 
       - name: Wait for Ingress address
         run: |
