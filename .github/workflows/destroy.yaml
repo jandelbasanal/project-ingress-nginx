@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: Type 'destroy' to confirm teardown (this deletes the EKS cluster)
+        description: Type 'destroy' to confirm teardown (this deletes the EKS cluster and related resources)
         required: true
         default: 'destroy'
 
@@ -31,11 +31,109 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install eksctl
+      - name: Install tools
         run: |
+          curl -sLo kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          curl -sLo /tmp/helm.tar.gz https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/helm.tar.gz
+          sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
           curl -sLo /tmp/eksctl.tar.gz https://github.com/weaveworks/eksctl/releases/download/v0.183.0/eksctl_Linux_amd64.tar.gz
           tar -C /tmp -xzf /tmp/eksctl.tar.gz
           sudo mv /tmp/eksctl /usr/local/bin/eksctl
+
+      - name: If cluster exists, clean up k8s resources that create external AWS dependencies (best-effort)
+        run: |
+          set +e
+          if aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Cluster exists; cleaning up in-cluster resources"
+            aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+            echo "Uninstall Helm releases (ingress-nginx, aws-load-balancer-controller) if present"
+            helm -n ingress-nginx uninstall ingress-nginx || true
+            helm -n kube-system uninstall aws-load-balancer-controller || true
+
+            echo "Delete known app manifests (namespace, ingress, svc, deployment)"
+            kubectl delete -f k8s/app/ingress.yaml --ignore-not-found=true || true
+            kubectl delete -f k8s/app/service.yaml --ignore-not-found=true || true
+            kubectl delete -f k8s/app/deployment.yaml --ignore-not-found=true || true
+            kubectl delete -f k8s/namespace.yaml --ignore-not-found=true || true
+
+            echo "Delete all ingresses cluster-wide"
+            kubectl delete ingress --all --all-namespaces || true
+
+            echo "Delete all services of type LoadBalancer cluster-wide"
+            LB_SVCS=$(kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+            if [ -n "$LB_SVCS" ]; then
+              echo "$LB_SVCS" | while read -r nsname; do
+                [ -z "$nsname" ] && continue
+                echo "Deleting service $nsname"
+                kubectl -n "${nsname%%/*}" delete svc "${nsname##*/}" || true
+              done
+            fi
+
+            echo "Wait up to 5 minutes for LB cleanup"
+            for i in {1..30}; do
+              REM=$(kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null | wc -l)
+              echo "Remaining LoadBalancer services: ${REM:-0}"
+              [ "${REM:-0}" = "0" ] && break
+              sleep 10
+            done
+          else
+            echo "Cluster not found; skipping in-cluster cleanup"
+          fi
+
+      - name: Cleanup orphaned AWS Load Balancers and Target Groups by tag (pre-delete, best-effort)
+        run: |
+          set +e
+          echo "Cleaning orphaned ELBv2 (ALB/NLB) tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          ELBV2_ARNS=$(aws elbv2 describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancers[].LoadBalancerArn' --output text 2>/dev/null || true)
+          if [ -n "$ELBV2_ARNS" ]; then
+            OWNED_ARNS=$(aws elbv2 describe-tags --region "$AWS_REGION" --resource-arns $ELBV2_ARNS \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
+            for ARN in $OWNED_ARNS; do
+              echo "Deleting ELBv2: $ARN"
+              aws elbv2 delete-load-balancer --region "$AWS_REGION" --load-balancer-arn "$ARN" || true
+            done
+          fi
+
+          echo "Cleaning orphaned Classic ELBs tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          CLASSIC_NAMES=$(aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text 2>/dev/null || true)
+          if [ -n "$CLASSIC_NAMES" ]; then
+            OWNED_CLASSIC=$(aws elb describe-tags --region "$AWS_REGION" --load-balancer-names $CLASSIC_NAMES \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].LoadBalancerName" --output text 2>/dev/null || true)
+            for NAME in $OWNED_CLASSIC; do
+              echo "Deleting Classic ELB: $NAME"
+              aws elb delete-load-balancer --region "$AWS_REGION" --load-balancer-name "$NAME" || true
+            done
+          fi
+
+          echo "Cleaning orphaned Target Groups tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          TGS=$(aws elbv2 describe-target-groups --region "$AWS_REGION" --query 'TargetGroups[].TargetGroupArn' --output text 2>/dev/null || true)
+          if [ -n "$TGS" ]; then
+            OWNED_TGS=$(aws elbv2 describe-tags --region "$AWS_REGION" --resource-arns $TGS \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
+            for TG in $OWNED_TGS; do
+              echo "Deleting Target Group: $TG"
+              aws elbv2 delete-target-group --region "$AWS_REGION" --target-group-arn "$TG" || true
+            done
+          fi
+
+          echo "Waiting briefly for ENIs to be released"
+          sleep 30
+
+      - name: Delete IAM OIDC provider for the cluster (best-effort if cluster present)
+        run: |
+          set +e
+          OIDC_URL=$(aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || true)
+          if [ -n "$OIDC_URL" ] && [ "$OIDC_URL" != "None" ]; then
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_URL#https://}"
+            echo "Deleting IAM OIDC provider: $PROVIDER_ARN"
+            aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$PROVIDER_ARN" || true
+          else
+            echo "OIDC provider not resolvable (cluster missing or no OIDC); skipping"
+          fi
 
       - name: Delete EKS cluster (may take 10-20 minutes)
         run: |
@@ -43,30 +141,76 @@ jobs:
           echo "Deleting cluster $EKS_CLUSTER_NAME in $AWS_REGION"
           eksctl delete cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
 
+      - name: Cleanup orphaned AWS Load Balancers and Target Groups by tag (post-delete, best-effort)
+        run: |
+          set +e
+          echo "Cleaning orphaned ELBv2 (ALB/NLB) tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          ELBV2_ARNS=$(aws elbv2 describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancers[].LoadBalancerArn' --output text 2>/dev/null || true)
+          if [ -n "$ELBV2_ARNS" ]; then
+            OWNED_ARNS=$(aws elbv2 describe-tags --region "$AWS_REGION" --resource-arns $ELBV2_ARNS \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
+            for ARN in $OWNED_ARNS; do
+              echo "Deleting ELBv2: $ARN"
+              aws elbv2 delete-load-balancer --region "$AWS_REGION" --load-balancer-arn "$ARN" || true
+            done
+          fi
+
+          echo "Cleaning orphaned Classic ELBs tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          CLASSIC_NAMES=$(aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text 2>/dev/null || true)
+          if [ -n "$CLASSIC_NAMES" ]; then
+            OWNED_CLASSIC=$(aws elb describe-tags --region "$AWS_REGION" --load-balancer-names $CLASSIC_NAMES \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].LoadBalancerName" --output text 2>/dev/null || true)
+            for NAME in $OWNED_CLASSIC; do
+              echo "Deleting Classic ELB: $NAME"
+              aws elb delete-load-balancer --region "$AWS_REGION" --load-balancer-name "$NAME" || true
+            done
+          fi
+
+          echo "Cleaning orphaned Target Groups tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          TGS=$(aws elbv2 describe-target-groups --region "$AWS_REGION" --query 'TargetGroups[].TargetGroupArn' --output text 2>/dev/null || true)
+          if [ -n "$TGS" ]; then
+            OWNED_TGS=$(aws elbv2 describe-tags --region "$AWS_REGION" --resource-arns $TGS \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
+            for TG in $OWNED_TGS; do
+              echo "Deleting Target Group: $TG"
+              aws elbv2 delete-target-group --region "$AWS_REGION" --target-group-arn "$TG" || true
+            done
+          fi
+
+          echo "Waiting briefly for ENIs to be released"
+          sleep 30
+
+      - name: Force-delete leftover CloudFormation stacks (best-effort)
+        run: |
+          set +e
+          for STACK in "eksctl-${EKS_CLUSTER_NAME}-cluster" "eksctl-${EKS_CLUSTER_NAME}-nodegroup-ng-app"; do
+            if aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK" >/dev/null 2>&1; then
+              echo "Deleting CloudFormation stack: $STACK"
+              aws cloudformation delete-stack --region "$AWS_REGION" --stack-name "$STACK" || true
+              echo "Waiting for stack deletion: $STACK"
+              aws cloudformation wait stack-delete-complete --region "$AWS_REGION" --stack-name "$STACK" || true
+            fi
+          done
+
       - name: Cleanup IAM policy/role for AWS Load Balancer Controller (best-effort)
         run: |
-          set -euo pipefail
+          set +e
           ROLE_NAME="AmazonEKSLoadBalancerControllerRole"
           POLICY_NAME="AWSLoadBalancerControllerIAMPolicy"
-          # Get role if exists
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-            echo "Role $ROLE_NAME exists; attempting to detach inline and managed policies and delete it"
-            # Try to detach the managed policy if attached
+            echo "Role $ROLE_NAME exists; detaching policies and deleting"
             POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName==\`$POLICY_NAME\`].Arn" --output text || true)
             if [ -n "${POLICY_ARN:-}" ]; then
               aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || true
             fi
-            # Delete any inline policies
             for p in $(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames[]' --output text || true); do
               aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$p" || true
             done
-            # Delete the role
             aws iam delete-role --role-name "$ROLE_NAME" || true
           else
             echo "Role $ROLE_NAME not found; skipping"
           fi
 
-          # Delete the customer-managed policy if it exists and is not attached
           POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName==\`$POLICY_NAME\`].Arn" --output text || true)
           if [ -n "${POLICY_ARN:-}" ]; then
             ATTACHMENTS=$(aws iam list-entities-for-policy --policy-arn "$POLICY_ARN" --query 'PolicyRoles|length(@)' --output text || echo 0)
