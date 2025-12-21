@@ -59,26 +59,37 @@ jobs:
             kubectl delete -f k8s/app/deployment.yaml --ignore-not-found=true || true
             kubectl delete -f k8s/namespace.yaml --ignore-not-found=true || true
 
-            echo "Delete all ingresses cluster-wide"
-            kubectl delete ingress --all --all-namespaces || true
+            echo "Delete all ingresses cluster-wide (with force finalizer removal if needed)"
+            for ingress in $(kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+              NS=$(echo $ingress | cut -d' ' -f1)
+              NAME=$(echo $ingress | cut -d' ' -f2)
+              echo "Deleting ingress $NS/$NAME"
+              kubectl delete ingress -n "$NS" "$NAME" --ignore-not-found=true || true
+              # Force remove finalizers if stuck
+              kubectl patch ingress -n "$NS" "$NAME" -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+            done
 
-            echo "Delete all services of type LoadBalancer cluster-wide"
-            LB_SVCS=$(kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
-            if [ -n "$LB_SVCS" ]; then
-              echo "$LB_SVCS" | while read -r nsname; do
-                [ -z "$nsname" ] && continue
-                echo "Deleting service $nsname"
-                kubectl -n "${nsname%%/*}" delete svc "${nsname##*/}" || true
-              done
-            fi
-
-            echo "Wait up to 5 minutes for LB cleanup"
-            for i in {1..30}; do
+            echo "Wait briefly for ALB cleanup (max 2 minutes)"
+            for i in {1..12}; do
               REM=$(kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null | wc -l)
               echo "Remaining LoadBalancer services: ${REM:-0}"
               [ "${REM:-0}" = "0" ] && break
               sleep 10
             done
+            
+            echo "Deleting all services of type LoadBalancer cluster-wide (force if needed)"
+            LB_SVCS=$(kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+            if [ -n "$LB_SVCS" ]; then
+              echo "$LB_SVCS" | while read -r nsname; do
+                [ -z "$nsname" ] && continue
+                NS="${nsname%%/*}"
+                SVC="${nsname##*/}"
+                echo "Force-deleting LoadBalancer service $NS/$SVC"
+                kubectl delete svc -n "$NS" "$SVC" --grace-period=0 --force 2>/dev/null || true
+              done
+            fi
+
+            echo "In-cluster cleanup completed"
           else
             echo "Cluster not found; skipping in-cluster cleanup"
           fi
@@ -93,18 +104,8 @@ jobs:
               --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
             for ARN in $OWNED_ARNS; do
               echo "Deleting ELBv2: $ARN"
-              aws elbv2 delete-load-balancer --region "$AWS_REGION" --load-balancer-arn "$ARN" || true
-            done
-          fi
-
-          echo "Cleaning orphaned Classic ELBs tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
-          CLASSIC_NAMES=$(aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text 2>/dev/null || true)
-          if [ -n "$CLASSIC_NAMES" ]; then
-            OWNED_CLASSIC=$(aws elb describe-tags --region "$AWS_REGION" --load-balancer-names $CLASSIC_NAMES \
-              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].LoadBalancerName" --output text 2>/dev/null || true)
-            for NAME in $OWNED_CLASSIC; do
-              echo "Deleting Classic ELB: $NAME"
-              aws elb delete-load-balancer --region "$AWS_REGION" --load-balancer-name "$NAME" || true
+              aws elbv2 delete-load-balancer --region "$AWS_REGION" --load-balancer-arn "$ARN" 2>&1 || true
+              sleep 2
             done
           fi
 
@@ -115,12 +116,24 @@ jobs:
               --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
             for TG in $OWNED_TGS; do
               echo "Deleting Target Group: $TG"
-              aws elbv2 delete-target-group --region "$AWS_REGION" --target-group-arn "$TG" || true
+              aws elbv2 delete-target-group --region "$AWS_REGION" --target-group-arn "$TG" 2>&1 || true
+              sleep 1
             done
           fi
 
-          echo "Waiting briefly for ENIs to be released"
-          sleep 30
+          echo "Cleaning orphaned Classic ELBs tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          CLASSIC_NAMES=$(aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text 2>/dev/null || true)
+          if [ -n "$CLASSIC_NAMES" ]; then
+            OWNED_CLASSIC=$(aws elb describe-tags --region "$AWS_REGION" --load-balancer-names $CLASSIC_NAMES \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].LoadBalancerName" --output text 2>/dev/null || true)
+            for NAME in $OWNED_CLASSIC; do
+              echo "Deleting Classic ELB: $NAME"
+              aws elb delete-load-balancer --region "$AWS_REGION" --load-balancer-name "$NAME" 2>&1 || true
+            done
+          fi
+
+          echo "ALB cleanup completed"
+          sleep 10
 
       - name: Delete IAM OIDC provider for the cluster (best-effort if cluster present)
         run: |
@@ -154,19 +167,9 @@ jobs:
             OWNED_ARNS=$(aws elbv2 describe-tags --region "$AWS_REGION" --resource-arns $ELBV2_ARNS \
               --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
             for ARN in $OWNED_ARNS; do
-              echo "Deleting ELBv2: $ARN"
-              aws elbv2 delete-load-balancer --region "$AWS_REGION" --load-balancer-arn "$ARN" || true
-            done
-          fi
-
-          echo "Cleaning orphaned Classic ELBs tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
-          CLASSIC_NAMES=$(aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text 2>/dev/null || true)
-          if [ -n "$CLASSIC_NAMES" ]; then
-            OWNED_CLASSIC=$(aws elb describe-tags --region "$AWS_REGION" --load-balancer-names $CLASSIC_NAMES \
-              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].LoadBalancerName" --output text 2>/dev/null || true)
-            for NAME in $OWNED_CLASSIC; do
-              echo "Deleting Classic ELB: $NAME"
-              aws elb delete-load-balancer --region "$AWS_REGION" --load-balancer-name "$NAME" || true
+              echo "Force-deleting ELBv2: $ARN"
+              aws elbv2 delete-load-balancer --region "$AWS_REGION" --load-balancer-arn "$ARN" 2>&1 || true
+              sleep 2
             done
           fi
 
@@ -177,12 +180,24 @@ jobs:
               --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].ResourceArn" --output text 2>/dev/null || true)
             for TG in $OWNED_TGS; do
               echo "Deleting Target Group: $TG"
-              aws elbv2 delete-target-group --region "$AWS_REGION" --target-group-arn "$TG" || true
+              aws elbv2 delete-target-group --region "$AWS_REGION" --target-group-arn "$TG" 2>&1 || true
+              sleep 1
             done
           fi
 
-          echo "Waiting briefly for ENIs to be released"
-          sleep 30
+          echo "Cleaning orphaned Classic ELBs tagged for cluster $EKS_CLUSTER_NAME in $AWS_REGION"
+          CLASSIC_NAMES=$(aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text 2>/dev/null || true)
+          if [ -n "$CLASSIC_NAMES" ]; then
+            OWNED_CLASSIC=$(aws elb describe-tags --region "$AWS_REGION" --load-balancer-names $CLASSIC_NAMES \
+              --query "TagDescriptions[?Tags[?Key==\`kubernetes.io/cluster/${EKS_CLUSTER_NAME}\` && Value==\`owned\`]].LoadBalancerName" --output text 2>/dev/null || true)
+            for NAME in $OWNED_CLASSIC; do
+              echo "Deleting Classic ELB: $NAME"
+              aws elb delete-load-balancer --region "$AWS_REGION" --load-balancer-name "$NAME" 2>&1 || true
+            done
+          fi
+
+          echo "Post-delete cleanup completed"
+          sleep 10
 
       - name: Force-delete leftover CloudFormation stacks (best-effort)
         run: |

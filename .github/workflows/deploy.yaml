@@ -92,8 +92,12 @@ jobs:
         run: |
           POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`].Arn' --output text || true)
           if [ -z "$POLICY_ARN" ]; then
+            echo "Creating AWSLoadBalancerControllerIAMPolicy..."
             curl -sLo iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.1/docs/install/iam_policy.json
             aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam-policy.json
+            sleep 5
+          else
+            echo "Policy already exists: $POLICY_ARN"
           fi
 
       - name: Create IAM role for service account via eksctl (if missing)
@@ -108,6 +112,15 @@ jobs:
               --override-existing-serviceaccounts \
               --approve \
               --region "$AWS_REGION"
+          else
+            echo "Role already exists: $ROLE_NAME"
+            # Verify the policy is attached
+            ATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`]' --output text || true)
+            if [ -z "$ATTACHED_POLICIES" ]; then
+              echo "Policy not attached to role, attaching now..."
+              POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`].Arn' --output text)
+              aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
+            fi
           fi
 
       - name: Install AWS Load Balancer Controller
@@ -120,6 +133,12 @@ jobs:
             --set region=$AWS_REGION \
             --set serviceAccount.create=false \
             --set serviceAccount.name=aws-load-balancer-controller
+
+      - name: Restart ALB Controller pods to pick up IAM permissions
+        run: |
+          echo "Restarting ALB Controller pods to apply new IAM permissions..."
+          kubectl rollout restart deployment/aws-load-balancer-controller -n kube-system
+          kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=300s
 
       - name: Wait for AWS Load Balancer Controller to be ready
         run: |
