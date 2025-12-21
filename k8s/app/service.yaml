@@ -6,7 +6,7 @@ metadata:
   labels:
     app: hello-world
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: hello-world
   ports:

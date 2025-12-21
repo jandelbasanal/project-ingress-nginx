@@ -151,6 +151,17 @@ jobs:
             fi
           done
 
+      - name: Verify ALB Controller is working
+        run: |
+          echo "=== ALB Controller Pod Status ==="
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+          echo ""
+          echo "=== ALB Controller Service Account ==="
+          kubectl get sa -n kube-system aws-load-balancer-controller -o yaml || true
+          echo ""
+          echo "=== Checking ALB Controller Logs for Errors ==="
+          kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50 | grep -i "error\|warning" || echo "No errors found in recent logs"
+
       - name: Verify Ingress and ALB Controller status
         run: |
           echo "=== Checking Ingress status ==="
