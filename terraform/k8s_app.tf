@@ -28,14 +28,20 @@ resource "kubernetes_deployment" "hello" {
           image = "public.ecr.aws/docker/library/nginx:1.25-alpine"
           port { container_port = 80 }
           readiness_probe {
-            http_get { path = "/"; port = 80 }
+            http_get {
+              path = "/"
+              port = 80
+            }
             initial_delay_seconds = 3
-            period_seconds = 5
+            period_seconds        = 5
           }
           liveness_probe {
-            http_get { path = "/"; port = 80 }
+            http_get {
+              path = "/"
+              port = 80
+            }
             initial_delay_seconds = 10
-            period_seconds = 10
+            period_seconds        = 10
           }
         }
       }
