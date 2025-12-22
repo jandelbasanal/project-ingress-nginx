@@ -3,7 +3,13 @@ name: Deploy to EKS
 on:
   push:
     branches: [ "master" ]
-
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: 'EKS cluster name (optional)'
+        required: false
+        default: demo-cluster
+        
 permissions:
   id-token: write
   contents: read
