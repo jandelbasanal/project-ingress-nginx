@@ -14,7 +14,10 @@ resource "helm_release" "aws_load_balancer_controller" {
       }
     })
   ]
-  depends_on = [aws_iam_role_policy_attachment.alb_attach]
+  depends_on = [
+    aws_iam_role_policy_attachment.alb_attach,
+    module.eks
+  ]
 }
 
 resource "helm_release" "ingress_nginx" {
@@ -24,4 +27,5 @@ resource "helm_release" "ingress_nginx" {
   namespace  = "ingress-nginx"
   create_namespace = true
   values = [file("${path.module}/helm_ingress_values.yaml")]
+  depends_on = [module.eks]
 }
