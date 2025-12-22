@@ -1,29 +1,37 @@
-name: Deploy to EKS
+name: Terraform Deploy (apply on push + manual destroy)
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "terraform_deploy" ]
   workflow_dispatch:
     inputs:
+      action:
+        description: 'apply or destroy'
+        required: true
+        default: 'apply'
       cluster:
-        description: 'EKS cluster name (optional)'
+        description: 'Base EKS cluster name (optional)'
         required: false
         default: demo-cluster
-        
+
 permissions:
   id-token: write
   contents: read
 
 env:
   AWS_REGION: ap-northeast-1
-  EKS_CLUSTER_NAME: demo-cluster
 
 jobs:
-  deploy:
+  terraform:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.6
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -32,201 +40,59 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install tools
+      - name: Compute branch-scoped names
         run: |
-          curl -sLo kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          curl -sLo /tmp/helm.tar.gz https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz
-          tar -C /tmp -xzf /tmp/helm.tar.gz
-          sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
-          curl -sLo /tmp/eksctl.tar.gz https://github.com/weaveworks/eksctl/releases/download/v0.183.0/eksctl_Linux_amd64.tar.gz
-          tar -C /tmp -xzf /tmp/eksctl.tar.gz
-          sudo mv /tmp/eksctl /usr/local/bin/eksctl
+          echo "TERRAFORM_STATE_KEY=project-ingress-nginx/${GITHUB_REF_NAME}.tfstate" >> $GITHUB_ENV
+          echo "TERRAFORM_CLUSTER_NAME=${{ github.event.inputs.cluster }}-${GITHUB_REF_NAME}" >> $GITHUB_ENV
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
 
-      - name: Cleanup stale CloudFormation stacks (if any)
+      - name: Terraform init
         run: |
-          set +e
-          STACK_NAME="eksctl-${EKS_CLUSTER_NAME}-cluster"
-          if aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" >/dev/null 2>&1; then
-            echo "Found CloudFormation stack: $STACK_NAME"
-            STACK_STATUS=$(aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text)
-            echo "Stack status: $STACK_STATUS"
-            if [[ "$STACK_STATUS" == *"FAILED"* ]] || [[ "$STACK_STATUS" == "ROLLBACK_COMPLETE" ]]; then
-              echo "Deleting failed/rollback stack: $STACK_NAME"
-              aws cloudformation delete-stack --region "$AWS_REGION" --stack-name "$STACK_NAME"
-              echo "Waiting for stack deletion (up to 10 minutes)..."
-              aws cloudformation wait stack-delete-complete --region "$AWS_REGION" --stack-name "$STACK_NAME" || true
-              echo "Stack deletion completed or timed out"
-            else
-              echo "Stack status is $STACK_STATUS; not deleting"
-            fi
-          else
-            echo "No stale CloudFormation stack found"
-          fi
-          set -e
+          terraform -chdir=terraform init \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}" \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_DDB_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -input=false
+        env:
+          TF_IN_AUTOMATION: 1
 
-      - name: Ensure EKS cluster exists (create if missing)
+      - name: Terraform plan
         run: |
-          if ! aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
-            echo "Cluster $EKS_CLUSTER_NAME not found in $AWS_REGION. Creating via eksctl..."
-            eksctl create cluster -f eks/cluster-config.yaml
-          else
-            echo "Cluster $EKS_CLUSTER_NAME exists."
-          fi
+          terraform -chdir=terraform plan -var="cluster_name=${{ env.TERRAFORM_CLUSTER_NAME }}" -out=plan.tfplan -input=false || true
 
-      - name: Update kubeconfig
+      - name: Terraform apply (on push or manual apply)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
         run: |
-          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+          terraform -chdir=terraform apply -input=false -auto-approve terraform/plan.tfplan || terraform -chdir=terraform apply -var="cluster_name=${{ env.TERRAFORM_CLUSTER_NAME }}" -auto-approve
 
-      - name: Create namespace
-        run: |
-          kubectl apply -f k8s/namespace.yaml
-
-      - name: Install ingress-nginx via Helm
-        run: |
-          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-          helm repo update
-          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
-            --namespace ingress-nginx --create-namespace \
-            -f helm/ingress-nginx-values.yaml
-
-      - name: Ensure IAM OIDC provider for EKS
-        run: |
-          eksctl utils associate-iam-oidc-provider --cluster "$EKS_CLUSTER_NAME" --approve --region "$AWS_REGION" || true
-
-      - name: Create IAM policy for ALB Controller (if missing)
-        run: |
-          POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`].Arn' --output text || true)
-          if [ -z "$POLICY_ARN" ]; then
-            echo "Creating AWSLoadBalancerControllerIAMPolicy..."
-            curl -sLo iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.1/docs/install/iam_policy.json
-            aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam-policy.json
-            sleep 5
-          else
-            echo "Policy already exists: $POLICY_ARN"
-          fi
-
-      - name: Create IAM role for service account via eksctl (if missing)
-        run: |
-          ROLE_NAME="AmazonEKSLoadBalancerControllerRole"
-          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-            eksctl create iamserviceaccount \
-              --cluster="$EKS_CLUSTER_NAME" \
-              --namespace=kube-system \
-              --name=aws-load-balancer-controller \
-              --attach-policy-arn=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`].Arn' --output text) \
-              --override-existing-serviceaccounts \
-              --approve \
-              --region "$AWS_REGION"
-          else
-            echo "Role already exists: $ROLE_NAME"
-            # Verify the policy is attached
-            ATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`]' --output text || true)
-            if [ -z "$ATTACHED_POLICIES" ]; then
-              echo "Policy not attached to role, attaching now..."
-              POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`AWSLoadBalancerControllerIAMPolicy`].Arn' --output text)
-              aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
-            fi
-          fi
-
-      - name: Install AWS Load Balancer Controller
-        run: |
-          helm repo add eks https://aws.github.io/eks-charts
-          helm repo update
-          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
-            -n kube-system \
-            --set clusterName=$EKS_CLUSTER_NAME \
-            --set region=$AWS_REGION \
-            --set serviceAccount.create=false \
-            --set serviceAccount.name=aws-load-balancer-controller
-
-      - name: Restart ALB Controller pods to pick up IAM permissions
-        run: |
-          echo "Restarting ALB Controller pods to apply new IAM permissions..."
-          kubectl rollout restart deployment/aws-load-balancer-controller -n kube-system
-          kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=300s
-
-      - name: Wait for AWS Load Balancer Controller to be ready
-        run: |
-          echo "Waiting for AWS Load Balancer Controller webhook to be ready..."
-          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=aws-load-balancer-controller -n kube-system --timeout=300s || true
-          echo "Waiting for webhook service endpoints..."
-          for i in {1..60}; do
-            ENDPOINTS=$(kubectl get endpoints aws-load-balancer-webhook-service -n kube-system -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
-            if [ -n "$ENDPOINTS" ]; then
-              echo "Webhook endpoints are available: $ENDPOINTS"
-              break
-            fi
-            echo "Attempt $i: Webhook endpoints not yet available, waiting..."
-            sleep 5
-          done
-          sleep 5
-
-      - name: Deploy app manifests
-        run: |
-          for i in {1..5}; do
-            echo "Attempt $i: Deploying app manifests..."
-            kubectl apply -f k8s/app/deployment.yaml && \
-            kubectl apply -f k8s/app/service.yaml && \
-            kubectl apply -f k8s/app/ingress.yaml && \
-            break
-            if [ $i -lt 5 ]; then
-              echo "Failed to deploy, retrying in 10 seconds..."
-              sleep 10
-            fi
-          done
-
-      - name: Verify ALB Controller is working
-        run: |
-          echo "=== ALB Controller Pod Status ==="
-          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
-          echo ""
-          echo "=== ALB Controller Service Account ==="
-          kubectl get sa -n kube-system aws-load-balancer-controller -o yaml || true
-          echo ""
-          echo "=== Checking ALB Controller Logs for Errors ==="
-          kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50 | grep -i "error\|warning" || echo "No errors found in recent logs"
-
-      - name: Verify Ingress and ALB Controller status
-        run: |
-          echo "=== Checking Ingress status ==="
-          kubectl -n demo describe ingress hello-world || true
-          echo ""
-          echo "=== Checking ALB Controller logs ==="
-          kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=30 || true
-          echo ""
-          echo "=== Checking for ALB events ==="
-          kubectl -n demo get events --sort-by='.lastTimestamp' || true
-
-      - name: Wait for Ingress address
-        run: |
-          for i in {1..120}; do
-            echo "Attempt $i: waiting for Ingress hostname (timeout: 20 minutes)..."
-            host=$(kubectl -n demo get ingress hello-world -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true)
-            if [ -n "$host" ]; then
-              echo "ALB Hostname: $host"
-              echo "$host" > alb_hostname.txt
-              break
-            fi
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "Still waiting... Checking Ingress status:"
-              kubectl -n demo get ingress hello-world -o wide || true
-            fi
-            sleep 10
-          done
-          if [ ! -s alb_hostname.txt ]; then
-            echo "ERROR: Ingress address never became available"
-            echo "=== Final Ingress status ==="
-            kubectl -n demo describe ingress hello-world || true
-            echo ""
-            echo "=== Recent ALB Controller logs ==="
-            kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50 || true
-            exit 1
-          fi
-          test -s alb_hostname.txt
-
-      - name: Upload ALB hostname artifact
+      - name: Upload tfplan
         uses: actions/upload-artifact@v4
         with:
-          name: alb-hostname
-          path: alb_hostname.txt
+          name: tfplan
+          path: terraform/plan.tfplan || true
+
+      - name: Configure kubeconfig and upload (if applied)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: |
+          aws eks update-kubeconfig --name "${{ env.TERRAFORM_CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
+          kubectl apply -f k8s/namespace.yaml || true
+          kubectl apply -f k8s/app/deployment.yaml || true
+          kubectl apply -f k8s/app/service.yaml || true
+          kubectl apply -f k8s/app/ingress.yaml || true
+        env:
+          KUBECONFIG: ${{ github.workspace }}/.kube/config
+
+      - name: Upload kubeconfig
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeconfig
+          path: ${{ github.workspace }}/.kube/config
+          retention-days: 1
+
+      - name: Terraform destroy (manual)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        run: |
+          terraform -chdir=terraform destroy -var="cluster_name=${{ env.TERRAFORM_CLUSTER_NAME }}" -auto-approve
