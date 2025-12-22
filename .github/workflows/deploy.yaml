@@ -125,19 +125,18 @@ jobs:
         run: |
           terraform -chdir=terraform plan -var="cluster_name=${{ env.TERRAFORM_CLUSTER_NAME }}" -out=tfplan -input=false || true
 
+      - name: Terraform apply (on push or manual apply)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: |
+          terraform -chdir=terraform apply -input=false -auto-approve tfplan || terraform -chdir=terraform apply -var="cluster_name=${{ env.TERRAFORM_CLUSTER_NAME }}" -auto-approve
+
       - name: Configure kubeconfig for Helm
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
         run: |
           mkdir -p $HOME/.kube
           aws eks update-kubeconfig --name "${{ env.TERRAFORM_CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}" --kubeconfig $HOME/.kube/config
         env:
           AWS_REGION: ${{ env.AWS_REGION }}
-
-      - name: Terraform apply (on push or manual apply)
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
-        run: |
-          terraform -chdir=terraform apply -input=false -auto-approve tfplan || terraform -chdir=terraform apply -var="cluster_name=${{ env.TERRAFORM_CLUSTER_NAME }}" -auto-approve
-        env:
-          KUBECONFIG: $HOME/.kube/config
 
       - name: Upload tfplan
         uses: actions/upload-artifact@v4
