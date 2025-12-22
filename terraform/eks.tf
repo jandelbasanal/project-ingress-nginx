@@ -17,16 +17,31 @@ module "eks" {
 
   cluster_name    = var.cluster_name
   cluster_version = "1.27"
-  subnets         = module.vpc.private_subnets
-  vpc_id          = module.vpc.vpc_id
+  
+  cluster_endpoint_public_access  = true
+  cluster_endpoint_private_access = true
 
-  manage_aws_auth = true
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = concat(module.vpc.private_subnets, module.vpc.public_subnets)
 
-  node_groups = {
+  manage_aws_auth_configmap = true
+
+  eks_managed_node_group_defaults = {
+    instance_types = ["t3.medium"]
+  }
+
+  eks_managed_node_groups = {
     ng-app = {
-      desired_capacity = 2
-      instance_type    = "t3.medium"
-      subnets          = module.vpc.private_subnets
+      name         = "ng-app"
+      min_size     = 2
+      max_size     = 4
+      desired_size = 2
+      instance_types = ["t3.medium"]
     }
+  }
+
+  tags = {
+    Environment = "test"
+    Project     = "wtv-test"
   }
 }
