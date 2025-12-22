@@ -42,7 +42,7 @@ jobs:
 
       - name: Create Terraform backend S3 bucket and DynamoDB table
         run: |
-          BUCKET_NAME="wtv-test"
+          BUCKET_NAME="wtv-test123456"
           TABLE_NAME="wtv-test-terraform-lock"
           
           echo "TERRAFORM_STATE_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
